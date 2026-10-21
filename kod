@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+import json
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import (
+    GridSearchCV,
+    StratifiedKFold,
+    train_test_split,
+)
+from sklearn.pipeline import Pipeline
+
+from grader_contracts.ensembles import EnsembleInput, EnsembleResult
+
+
+def _run(data: EnsembleInput):
+    x_train = np.asarray(data.train_features, dtype=float)
+    x_test = np.asarray(data.test_features, dtype=float)
+    y_train = np.asarray(data.train_target).ravel()
+
+    classes, counts = np.unique(y_train, return_counts=True)
+    if not np.array_equal(classes, [0, 1]):
+        raise ValueError("В train_target должны быть классы 0 и 1.")
+    if counts.min() < 2:
+        raise ValueError("Для кросс-валидации нужно минимум 2 объекта каждого класса.")
+
+    pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", RandomForestClassifier(
+            n_estimators=200,
+            random_state=data.random_seed,
+            n_jobs=1,
+        )),
+    ])
+
+    search = GridSearchCV(
+        pipeline,
+        param_grid={
+            "model__max_depth": [8, None],
+            "model__min_samples_leaf": [2, 4],
+        },
+        scoring={
+            "roc_auc": "roc_auc",
+            "accuracy": "accuracy",
+            "precision": "precision",
+            "recall": "recall",
+            "f1": "f1",
+        },
+        refit="roc_auc",
+        cv=StratifiedKFold(
+            n_splits=min(3, int(counts.min())),
+            shuffle=True,
+            random_state=data.random_seed,
+        ),
+        n_jobs=-1,
+        error_score="raise",
+    )
+    search.fit(x_train, y_train)
+
+    model = search.best_estimator_
+    positive_index = list(model.classes_).index(1)
+    probabilities = model.predict_proba(x_test)[:, positive_index]
+    predictions = (probabilities >= 0.5).astype(int)
+
+    # Тестовые ответы используются только после выбора и обучения модели.
+    y_test = np.asarray(data.test_target).ravel()
+    params = search.best_params_
+
+    result = EnsembleResult(
+        model_name=(
+            "RandomForestClassifier("
+            f"n_estimators=200, max_depth={params['model__max_depth']}, "
+            f"min_samples_leaf={params['model__min_samples_leaf']})"
+        ),
+        probabilities=probabilities,
+        predictions=predictions,
+        roc_auc=float(roc_auc_score(y_test, probabilities)),
+        accuracy=float(accuracy_score(y_test, predictions)),
+        precision=float(precision_score(y_test, predictions, zero_division=0)),
+        recall=float(recall_score(y_test, predictions, zero_division=0)),
+        f1=float(f1_score(y_test, predictions, zero_division=0)),
+    )
+    return result, search
+
+
+def run_ensemble_experiment(data: EnsembleInput) -> EnsembleResult:
+    result, _ = _run(data)
+    return result
+
+
+def main():
+    directory = Path(__file__).resolve().parent
+    frame = pd.read_csv(directory / "german.csv", sep=";")
+    frame.columns = frame.columns.str.strip()
+
+    target = (
+        "Creditability"
+        if "Creditability" in frame.columns
+        else frame.columns[0]
+    )
+    x = frame.drop(columns=target).apply(pd.to_numeric, errors="raise")
+    y = pd.to_numeric(frame[target], errors="raise")
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        x,
+        y,
+        test_size=0.2,
+        stratify=y,
+        random_state=42,
+    )
+
+    result, search = _run(EnsembleInput(
+        train_features=x_train,
+        train_target=y_train,
+        test_features=x_test,
+        test_target=y_test,
+        random_seed=42,
+    ))
+
+    metric_names = ["roc_auc", "accuracy", "precision", "recall", "f1"]
+    experiments = []
+
+    for index, params in enumerate(search.cv_results_["params"]):
+        experiments.append({
+            "parameters": params,
+            **{
+                name: float(
+                    search.cv_results_[f"mean_test_{name}"][index]
+                )
+                for name in metric_names
+            },
+        })
+
+    test_metrics = {
+        name: float(getattr(result, name))
+        for name in metric_names
+    }
+
+    payload = {
+        "random_seed": 42,
+        "selection_criterion": "mean CV ROC-AUC on train",
+        "experiments": experiments,
+        "selected_model": result.model_name,
+        "test_metrics": test_metrics,
+        "result": {
+            key: value.tolist() if isinstance(value, np.ndarray) else value
+            for key, value in asdict(result).items()
+        },
+    }
+
+    (directory / "experiment_results.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+
+    rows = []
+    for experiment in experiments:
+        params = experiment["parameters"]
+        label = (
+            f"depth={params['model__max_depth']}, "
+            f"leaf={params['model__min_samples_leaf']}"
+        )
+        values = " | ".join(
+            f"{experiment[name]:.6f}" for name in metric_names
+        )
+        rows.append(f"| {label} | {values} |")
+
+    test_row = " | ".join(
+        f"{test_metrics[name]:.6f}" for name in metric_names
+    )
+    worst_auc = min(item["roc_auc"] for item in experiments)
+    best_auc = float(search.best_score_)
+
+    report = f"""# Лабораторная работа №4
+
+## Данные и подготовка
+
+Использован german.csv. Целевая переменная — {target}.
+Размер данных: {len(frame)} объектов, {x.shape[1]} признаков.
+Положительный класс — 1.
+
+Разбиение стратифицированное: 80% train и 20% test, random_state=42.
+Размер train: {len(x_train)}, test: {len(x_test)}.
+Количество пропусков в признаках: {int(x.isna().sum().sum())}.
+
+Пропуски заменяются медианами внутри Pipeline. При кросс-валидации
+медианы вычисляются отдельно на обучающей части каждого фолда.
+Масштабирование не применяется: деревья не требуют стандартизации.
+Числовые коды категорий оставлены без one-hot-кодирования.
+
+## Гипотезы и эксперименты
+
+Проверены четыре конфигурации Random Forest с 200 деревьями.
+max_depth принимает значения 8 и None, min_samples_leaf — 2 и 4.
+Гипотеза: ограничение глубины и увеличение размера листа могут уменьшить
+переобучение, но слишком сильные ограничения могут ухудшить качество.
+
+Все конфигурации проверены на одинаковых стратифицированных фолдах
+только внутри train. Критерий выбора — средний ROC-AUC кросс-валидации.
+После выбора лучшая конфигурация повторно обучена на всём train.
+Тестовые ответы не используются при обучении и подборе параметров.
+
+## Метрики
+
+Средние значения на кросс-валидации:
+
+| Параметры | ROC-AUC | Accuracy | Precision | Recall | F1 |
+|---|---:|---:|---:|---:|---:|
+{chr(10).join(rows)}
+
+Оценка выбранной модели на отложенном test:
+
+| Модель | ROC-AUC | Accuracy | Precision | Recall | F1 |
+|---|---:|---:|---:|---:|---:|
+| Random Forest | {test_row} |
+
+ROC-AUC рассчитан по вероятностям.
+Для остальных метрик используется порог 0.5.
+
+## Выбранная модель
+
+{result.model_name}
+
+Модель выбрана по максимальному среднему CV ROC-AUC: {best_auc:.6f}.
+При равенстве оценок GridSearchCV выбирает первую конфигурацию.
+Тестовые метрики не участвовали в выборе.
+
+## Выводы и ограничения
+
+Разница между лучшей и худшей конфигурацией по CV ROC-AUC:
+{best_auc - worst_auc:.6f}.
+
+Случайный лес усредняет прогнозы деревьев, обученных на bootstrap-выборках
+со случайным подмножеством признаков при поиске разделений.
+Это уменьшает зависимость результата от одного дерева.
+
+Исследована небольшая сетка параметров одного семейства моделей.
+Полученные оценки не доказывают превосходство над другими алгоритмами.
+Тестовая оценка относится к одному разбиению.
+Категориальные коды интерпретируются как числа, что может ограничивать
+качество. One-hot-кодирование и подбор порога отдельно не проверялись.
+
+## Воспроизводимость
+
+Seed: 42. Доля test: 0.2. Разбиение с stratify по целевой переменной.
+Кросс-валидация: StratifiedKFold с перемешиванием, random_state=42.
+Число фолдов: {search.n_splits_}.
+
+Команда запуска: python ensemble_models.py.
+Рядом должны находиться german.csv и исходная папка grader_contracts.
+Численные результаты сохраняются в experiment_results.json.
+"""
+
+    (directory / "REPORT.md").write_text(report, encoding="utf-8")
+    print(result.model_name)
+    print(json.dumps(test_metrics, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
